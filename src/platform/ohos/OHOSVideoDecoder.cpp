@@ -100,6 +100,7 @@ OHOSVideoDecoder::~OHOSVideoDecoder() {
     }
   }
   if (videoCodec != nullptr) {
+    releaseOutputBuffer();
     OH_VideoDecoder_Flush(videoCodec);
     OH_VideoDecoder_Stop(videoCodec);
     OH_VideoDecoder_Destroy(videoCodec);
@@ -133,7 +134,6 @@ bool OHOSVideoDecoder::initDecoder(const OH_AVCodecCategory avCodecCategory) {
   OH_AVFormat* ohFormat = OH_AVFormat_Create();
   OH_AVFormat_SetIntValue(ohFormat, OH_MD_KEY_WIDTH, videoFormat.width);
   OH_AVFormat_SetIntValue(ohFormat, OH_MD_KEY_HEIGHT, videoFormat.height);
-  OH_AVFormat_SetIntValue(ohFormat, OH_MD_KEY_VIDEO_ENABLE_LOW_LATENCY, 1);
   OH_AVFormat_SetIntValue(ohFormat, OH_MD_KEY_PIXEL_FORMAT, AV_PIXEL_FORMAT_NV12);
   ret = OH_VideoDecoder_Configure(videoCodec, ohFormat);
   OH_AVFormat_Destroy(ohFormat);
@@ -146,6 +146,15 @@ bool OHOSVideoDecoder::initDecoder(const OH_AVCodecCategory avCodecCategory) {
     LOGE("video decoder prepare failed!, ret:%d", ret);
     return false;
   }
+  /**
+   * According to HarmonyOS recommendations, temporarily modify the maximum number of hardware
+   * decoding frames to 16 and the maximum number of software decoding frames to maxReorderSize + 1
+   * to avoid stuttering on some HarmonyOS devices due to insufficient decoding data. However, this
+   * modification will increase memory usage. Subsequent adjustments will be made once the
+   * HarmonyOS system is improved.
+   */
+  maxPendingFramesCount =
+      (codecCategory == HARDWARE) ? 16 : static_cast<size_t>(videoFormat.maxReorderSize) + 1;
   if (!start()) {
     LOGE("video decoder start failed!, ret:%d", ret);
     return false;
@@ -194,14 +203,11 @@ DecodingResult OHOSVideoDecoder::onEndOfStream() {
 }
 
 DecodingResult OHOSVideoDecoder::onDecodeFrame() {
+  releaseOutputBuffer();
   std::unique_lock<std::mutex> lock(codecUserData->outputMutex);
   codecUserData->outputCondition.wait(lock, [this]() {
-    // In the PAG file, video sequence frame software decoding testing requires sending additional
-    // data before obtaining the decoded data. If compatibility with user video decoding is desired,
-    // retesting is necessary.
     return codecUserData->outputBufferInfoQueue.size() > 0 ||
-           pendingFrames.size() <= static_cast<size_t>(videoFormat.maxReorderSize) +
-                                       (codecCategory == SOFTWARE ? 1 : 0);
+           pendingFrames.size() <= maxPendingFramesCount;
   });
   if (codecUserData->outputBufferInfoQueue.size() > 0) {
     codecBufferInfo = codecUserData->outputBufferInfoQueue.front();
@@ -214,11 +220,6 @@ DecodingResult OHOSVideoDecoder::onDecodeFrame() {
   } else {
     lock.unlock();
     return DecodingResult::Success;
-  }
-  int ret = OH_VideoDecoder_FreeOutputBuffer(videoCodec, codecBufferInfo.bufferIndex);
-  if (ret != AV_ERR_OK) {
-    LOGE("OH_VideoDecoder_FreeOutputBuffer failed, ret:%d", ret);
-    return DecodingResult::Error;
   }
   if (codecBufferInfo.attr.flags == AVCODEC_BUFFER_FLAGS_EOS) {
     return DecodingResult::EndOfStream;
@@ -308,6 +309,16 @@ std::shared_ptr<tgfx::ImageBuffer> OHOSVideoDecoder::onRenderFrame() {
     imageBuffer = tgfx::ImageBuffer::MakeNV12(yuvData, videoFormat.colorSpace);
   }
   return imageBuffer;
+}
+
+void OHOSVideoDecoder::releaseOutputBuffer() {
+  if (codecBufferInfo.buffer) {
+    int ret = OH_VideoDecoder_FreeOutputBuffer(videoCodec, codecBufferInfo.bufferIndex);
+    if (ret != AV_ERR_OK) {
+      LOGE("OH_VideoDecoder_FreeOutputBuffer failed, ret:%d", ret);
+    }
+    codecBufferInfo = {0, nullptr};
+  }
 }
 
 }  // namespace pag
